@@ -2,17 +2,12 @@
 """
 ╔══════════════════════════════════════════════════════════════════════╗
 ║        CodeAlpha Cyber Security Internship — Task 1                  ║
-║               Advanced Network Sniffer (v3.2)                        ║
+║               Advanced Network Sniffer (v4.0)                        ║
 ║                                                                      ║
 ║  Author  : Mohammed Mounassib                                        ║
-║  Version : 3.2.0 (Deep Packet Inspection Edition)                    ║
+║  Version : 4.0.0 (Rich TUI & Target IP Edition)                      ║
 ║  License : MIT (educational use)                                     ║
 ╚══════════════════════════════════════════════════════════════════════╝
-
-DESCRIPTION:
-An asynchronous, multi-threaded network packet sniffer built with Scapy.
-Upgraded with Deep Packet Inspection (DPI) to extract HTTP Host headers
-and HTTPS Server Name Indication (SNI) domains.
 """
 
 import argparse
@@ -20,12 +15,12 @@ import os
 import sys
 import threading
 from queue import Queue
+from collections import deque
 from datetime import datetime
 
 try:
     from scapy.all import sniff, wrpcap, IP, TCP, UDP, ICMP, conf, Raw, load_layer
     from scapy.layers.dns import DNSQR
-    # Load TLS module for Deep Packet Inspection on HTTPS
     load_layer("tls")
     from scapy.layers.tls.handshake import TLSClientHello
     from scapy.layers.tls.extensions import TLS_Ext_ServerName
@@ -34,27 +29,29 @@ except ImportError:
     sys.exit(1)
 
 try:
-    from colorama import init, Fore, Style
-    init(autoreset=True)
+    from rich.console import Console, Group
+    from rich.live import Live
+    from rich.table import Table
+    from rich.panel import Panel
+    from rich.text import Text
 except ImportError:
-    print("[ERROR] Colorama is not installed. Run: pip install colorama")
+    print("[ERROR] Rich is not installed. Run: pip install rich")
     sys.exit(1)
 
 # ================= CONFIGURATION & MAPPING =================
 conf.use_pcap = True
 packet_queue = Queue()
 captured_packets = []
+console = Console()
 
-PROTOCOLS = {
-    1: "ICMP", 2: "IGMP", 6: "TCP", 17: "UDP", 
-    41: "IPv6", 47: "GRE", 50: "ESP", 51: "AH", 89: "OSPF"
-}
+# The "Locked" Memory: Only remember the last 15 packets for the UI
+recent_packets = deque(maxlen=15)
+
+PROTOCOLS = {1: "ICMP", 2: "IGMP", 6: "TCP", 17: "UDP", 41: "IPv6", 89: "OSPF"}
 
 SERVICES = {
-    20: "FTP-DATA", 21: "FTP", 22: "SSH", 23: "Telnet", 25: "SMTP",
-    53: "DNS", 67: "DHCP", 68: "DHCP", 80: "HTTP", 110: "POP3",
-    123: "NTP", 143: "IMAP", 161: "SNMP", 443: "HTTPS", 445: "SMB",
-    3306: "MySQL", 3389: "RDP", 5432: "PostgreSQL"
+    21: "FTP", 22: "SSH", 23: "Telnet", 25: "SMTP", 53: "DNS",
+    80: "HTTP", 443: "HTTPS", 445: "SMB", 3306: "MySQL", 3389: "RDP"
 }
 
 class Stats:
@@ -63,98 +60,125 @@ class Stats:
     udp = 0
     dns = 0
     icmp = 0
-    other = 0
 
 base_dir = os.path.dirname(os.path.abspath(__file__))
 log_path = os.path.join(base_dir, "session_log.txt")
 
+# ================= UI GENERATOR =================
+def generate_dashboard():
+    """Builds the dynamic Rich table and stats panel."""
+    table = Table(
+        title="[bold cyan]⚡ LIVE NETWORK INTERCEPT ⚡[/bold cyan]", 
+        border_style="cyan", 
+        expand=True
+    )
+    
+    table.add_column("Time", justify="center", style="cyan", no_wrap=True)
+    table.add_column("Proto", justify="center", style="bold white")
+    table.add_column("Source", style="yellow")
+    table.add_column("Destination", style="green")
+    table.add_column("Service / Payload", style="magenta")
+
+    for pkt in recent_packets:
+        table.add_row(pkt['time'], pkt['proto'], pkt['src'], pkt['dst'], pkt['service'])
+
+    stats_text = (
+        f"[white]Total Packets:[/white] [bold cyan]{Stats.total}[/bold cyan]  |  "
+        f"[white]TCP:[/white] [bold red]{Stats.tcp}[/bold red]  |  "
+        f"[white]UDP:[/white] [bold blue]{Stats.udp}[/bold blue]  |  "
+        f"[white]DNS:[/white] [bold magenta]{Stats.dns}[/bold magenta]  |  "
+        f"[white]ICMP:[/white] [bold yellow]{Stats.icmp}[/bold yellow]"
+    )
+    
+    stats_panel = Panel(stats_text, border_style="cyan")
+    return Group(table, stats_panel)
+
 # ================= WORKER THREAD (CONSUMER) =================
-def process_packets(log_file, verbose):
-    while True:
-        packet = packet_queue.get()
-        if packet is None:
-            break
+def process_packets(log_file):
+    # Start the locked, live-updating UI
+    with Live(generate_dashboard(), refresh_per_second=10, screen=True) as live:
+        while True:
+            packet = packet_queue.get()
+            if packet is None:
+                break
 
-        Stats.total += 1
-        current_time = datetime.now().strftime("%H:%M:%S")
+            Stats.total += 1
+            current_time = datetime.now().strftime("%H:%M:%S")
 
-        if packet.haslayer(IP):
-            src_ip = packet[IP].src
-            dst_ip = packet[IP].dst
-            proto_num = packet[IP].proto
-            proto_name = PROTOCOLS.get(proto_num, f"UNKNOWN({proto_num})")
-            
-            src_port, dst_port, service = "N/A", "N/A", "N/A"
-            color = Fore.WHITE
-
-            # -- TCP LAYER (With HTTP/HTTPS Deep Inspection) --
-            if packet.haslayer(TCP):
-                Stats.tcp += 1
-                color = Fore.LIGHTRED_EX
-                src_port, dst_port = packet[TCP].sport, packet[TCP].dport
-                service = SERVICES.get(dst_port, SERVICES.get(src_port, "Unknown TCP"))
-
-                # 1. Inspect HTTP (Port 80) for Host name
-                if service == "HTTP" and packet.haslayer(Raw):
-                    try:
-                        payload = packet[Raw].load.decode('utf-8', errors='ignore')
-                        for line in payload.split('\r\n'):
-                            if line.startswith('Host: '):
-                                domain = line.split(' ')[1]
-                                service = f"HTTP ({domain})"
-                                color = Fore.LIGHTGREEN_EX
-                                break
-                    except:
-                        pass
-
-                # 2. Inspect HTTPS (Port 443) for SNI (Server Name)
-                elif service == "HTTPS" and packet.haslayer(TLSClientHello):
-                    try:
-                        if packet.haslayer(TLS_Ext_ServerName):
-                            server_names = packet[TLS_Ext_ServerName].servernames
-                            if server_names:
-                                domain = server_names[0].servername.decode('utf-8')
-                                service = f"HTTPS ({domain})"
-                                color = Fore.LIGHTGREEN_EX
-                    except:
-                        pass
-            
-            # -- UDP LAYER --
-            elif packet.haslayer(UDP):
-                Stats.udp += 1
-                color = Fore.LIGHTCYAN_EX
-                src_port, dst_port = packet[UDP].sport, packet[UDP].dport
-                service = SERVICES.get(dst_port, SERVICES.get(src_port, "Unknown UDP"))
+            if packet.haslayer(IP):
+                src_ip = packet[IP].src
+                dst_ip = packet[IP].dst
+                proto_num = packet[IP].proto
+                proto_name = PROTOCOLS.get(proto_num, f"IP({proto_num})")
                 
-                if packet.haslayer(DNSQR):
-                    Stats.dns += 1
-                    color = Fore.LIGHTMAGENTA_EX
-                    proto_name = "DNS"
-                    service = packet[DNSQR].qname.decode(errors='ignore')
+                src_port, dst_port, service = "", "", "Unknown"
+                ui_proto = f"[{proto_name}]"
+
+                # -- TCP & Deep Packet Inspection --
+                if packet.haslayer(TCP):
+                    Stats.tcp += 1
+                    ui_proto = f"[bold red]TCP[/bold red]"
+                    src_port, dst_port = packet[TCP].sport, packet[TCP].dport
+                    service = SERVICES.get(dst_port, SERVICES.get(src_port, "Unknown TCP"))
+
+                    if service == "HTTP" and packet.haslayer(Raw):
+                        try:
+                            payload = packet[Raw].load.decode('utf-8', errors='ignore')
+                            for line in payload.split('\r\n'):
+                                if line.startswith('Host: '):
+                                    domain = line.split(' ')[1]
+                                    service = f"[bold green]HTTP ({domain})[/bold green]"
+                                    break
+                        except: pass
+
+                    elif service == "HTTPS" and packet.haslayer(TLSClientHello):
+                        try:
+                            if packet.haslayer(TLS_Ext_ServerName):
+                                server_names = packet[TLS_Ext_ServerName].servernames
+                                if server_names:
+                                    domain = server_names[0].servername.decode('utf-8')
+                                    service = f"[bold green]HTTPS ({domain})[/bold green]"
+                        except: pass
+                
+                # -- UDP & DNS --
+                elif packet.haslayer(UDP):
+                    Stats.udp += 1
+                    ui_proto = f"[bold blue]UDP[/bold blue]"
+                    src_port, dst_port = packet[UDP].sport, packet[UDP].dport
+                    service = SERVICES.get(dst_port, SERVICES.get(src_port, "Unknown UDP"))
                     
-            # -- ICMP LAYER --
-            elif packet.haslayer(ICMP):
-                Stats.icmp += 1
-                color = Fore.LIGHTYELLOW_EX
-                proto_name = "ICMP"
-                service = "Ping / Control"
+                    if packet.haslayer(DNSQR):
+                        Stats.dns += 1
+                        ui_proto = f"[bold magenta]DNS[/bold magenta]"
+                        service = f"[italic]{packet[DNSQR].qname.decode(errors='ignore')}[/italic]"
                 
-            else:
-                Stats.other += 1
-                color = Fore.LIGHTYELLOW_EX
+                # -- ICMP --
+                elif packet.haslayer(ICMP):
+                    Stats.icmp += 1
+                    ui_proto = f"[bold yellow]ICMP[/bold yellow]"
+                    service = "Ping / Control"
 
-            # -- Live Terminal Dashboard --
-            print(color + f"[{current_time}] {proto_name:<4} | {src_ip}:{src_port} -> {dst_ip}:{dst_port} | {service}")
+                # Append to our UI Memory
+                src_full = f"{src_ip}:{src_port}" if src_port else src_ip
+                dst_full = f"{dst_ip}:{dst_port}" if dst_port else dst_ip
+                
+                recent_packets.append({
+                    'time': current_time,
+                    'proto': ui_proto,
+                    'src': src_full,
+                    'dst': dst_full,
+                    'service': service
+                })
 
-            if verbose:
-                print(Style.DIM + f"   └── Size: {len(packet)} bytes | Layers: {packet.summary()}")
+                # Refresh the dashboard
+                live.update(generate_dashboard())
 
-            # -- File Logging --
-            log_entry = f"[{current_time}] {proto_name} | {src_ip}:{src_port} -> {dst_ip}:{dst_port} | Service: {service}\n"
-            log_file.write(log_entry)
-            log_file.flush()
+                # File Logging
+                log_entry = f"[{current_time}] {proto_name} | {src_full} -> {dst_full} | Service: {service}\n"
+                log_file.write(log_entry)
+                log_file.flush()
 
-        packet_queue.task_done()
+            packet_queue.task_done()
 
 # ================= SNIFFER CALLBACK (PRODUCER) =================
 def packet_callback(packet):
@@ -163,75 +187,66 @@ def packet_callback(packet):
 
 # ================= MAIN LAUNCHER =================
 def main():
-    parser = argparse.ArgumentParser(description="CodeAlpha Advanced Network Sniffer")
-    parser.add_argument("-c", "--count", type=int, default=0, help="Number of packets to capture")
-    parser.add_argument("-f", "--filter", type=str, default="", help="BPF filter")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Show detailed packet summary")
-    parser.add_argument("-o", "--output", type=str, default="capture.pcap", help="Output PCAP filename")
+    parser = argparse.ArgumentParser(description="Advanced Network Sniffer v4.0")
+    parser.add_argument("-c", "--count", type=int, default=0, help="Packets to capture")
+    parser.add_argument("-o", "--output", type=str, default="capture.pcap", help="Output PCAP")
     args = parser.parse_args()
 
-    bpf_filter = args.filter
-    if not sys.argv[1:]:
-        print(Fore.LIGHTCYAN_EX + "╔══════════════════════════════════════════╗")
-        print(Fore.LIGHTGREEN_EX + "║      PYTHON NETWORK SNIFFER v3.2         ║")
-        print(Fore.LIGHTCYAN_EX + "╚══════════════════════════════════════════╝")
-        print("1 → TCP Only")
-        print("2 → UDP Only")
-        print("3 → DNS Only (Port 53)")
-        print("4 → ICMP Only (Ping)")
-        print("5 → IGMP Only (Multicast)")
-        print("6 → IPv6 Traffic Only")
-        print("7 → OSPF Only (Routing)")
-        print("8 → ALL Traffic\n")
-        
-        choice = input("Enter Choice (1-8): ").strip()
-        
-        if choice == "1": bpf_filter = "tcp"
-        elif choice == "2": bpf_filter = "udp"
-        elif choice == "3": bpf_filter = "udp port 53"
-        elif choice == "4": bpf_filter = "icmp"
-        elif choice == "5": bpf_filter = "igmp"
-        elif choice == "6": bpf_filter = "ip6"
-        elif choice == "7": bpf_filter = "ip proto 89"
-        elif choice == "8": bpf_filter = ""
-        else: 
-            print(Fore.LIGHTYELLOW_EX + "[!] Invalid choice. Defaulting to ALL Traffic.")
-            bpf_filter = ""
+    console.clear()
+    console.print(Panel("[bold green]PYTHON NETWORK SNIFFER v4.0[/bold green]", expand=False, border_style="cyan"))
+    console.print("1 → TCP Only")
+    console.print("2 → UDP Only")
+    console.print("3 → DNS Only (Port 53)")
+    console.print("4 → ICMP Only (Ping)")
+    console.print("8 → ALL Traffic")
+    console.print("[bold yellow]9 → Target a Specific IP Address 🎯[/bold yellow]\n")
+    
+    choice = input("Enter Choice: ").strip()
+    
+    bpf_filter = ""
+    if choice == "1": bpf_filter = "tcp"
+    elif choice == "2": bpf_filter = "udp"
+    elif choice == "3": bpf_filter = "udp port 53"
+    elif choice == "4": bpf_filter = "icmp"
+    elif choice == "9":
+        target_ip = input("    [?] Enter the target IP (e.g., 192.168.1.50): ").strip()
+        bpf_filter = f"host {target_ip}"
+    elif choice != "8":
+        console.print("[yellow][!] Invalid choice. Defaulting to ALL Traffic.[/yellow]")
 
-    print(Fore.LIGHTGREEN_EX + f"\n[*] Starting capture engine (Deep Packet Inspection Active)...")
-    print(Fore.LIGHTGREEN_EX + f"[*] Live logs saving to: {log_path}")
-    print(Fore.LIGHTRED_EX + "[*] Press Ctrl+C to stop capture and generate report.\n")
+    console.print("\n[bold green][*] Starting capture engine...[/bold green]")
+    console.print("[bold red][*] Press Ctrl+C to stop capture and generate report.[/bold red]\n")
+    import time
+    time.sleep(2) # Give user a second to read before clearing screen
 
     log_file = open(log_path, "a", encoding="utf-8")
-    worker = threading.Thread(target=process_packets, args=(log_file, args.verbose), daemon=True)
+    worker = threading.Thread(target=process_packets, args=(log_file,), daemon=True)
     worker.start()
 
     try:
         sniff(filter=bpf_filter, prn=packet_callback, count=args.count, store=False)
     except PermissionError:
-        print(Fore.LIGHTRED_EX + "\n[!] ERROR: You must run this script with sudo/administrative privileges.")
+        console.print("[bold red]\n[!] ERROR: You must run this script with sudo privileges.[/bold red]")
         sys.exit(1)
     except KeyboardInterrupt:
         pass
     finally:
-        print(Fore.LIGHTYELLOW_EX + "\n\n[!] HALTING ENGINE & GENERATING REPORT...")
         packet_queue.put(None) 
         worker.join(timeout=2.0)
         log_file.close()
 
         if captured_packets:
             wrpcap(args.output, captured_packets)
-            print(Fore.LIGHTGREEN_EX + f"[+] {len(captured_packets)} raw packets saved to {args.output}")
-
-        print(Fore.LIGHTCYAN_EX + "\n" + "="*40)
-        print(Fore.LIGHTYELLOW_EX + "        SESSION TRAFFIC REPORT")
-        print(Fore.LIGHTCYAN_EX + "="*40)
-        print(Fore.WHITE + f"Total Packets Captured : {Stats.total}")
-        print(Fore.LIGHTRED_EX + f"TCP Packets            : {Stats.tcp}")
-        print(Fore.LIGHTCYAN_EX + f"UDP Packets            : {Stats.udp}")
-        print(Fore.LIGHTMAGENTA_EX + f"DNS Queries            : {Stats.dns}")
-        print(Fore.LIGHTYELLOW_EX + f"ICMP Packets           : {Stats.icmp}")
-        print(Fore.LIGHTCYAN_EX + "="*40 + "\n")
+            
+        console.clear()
+        console.print(Panel(
+            f"[bold white]Total Packets Captured:[/bold white] {Stats.total}\n"
+            f"[bold green]PCAP File Saved:[/bold green] {args.output}\n"
+            f"[bold cyan]Log File Saved:[/bold cyan] {log_path}",
+            title="[bold yellow]SESSION TERMINATED[/bold yellow]",
+            border_style="cyan",
+            expand=False
+        ))
 
 if __name__ == "__main__":
     main()
